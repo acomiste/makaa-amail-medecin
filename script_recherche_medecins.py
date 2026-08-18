@@ -101,7 +101,11 @@ def signaler_medecin_traite(nom_thread):
 
 def creer_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--start-maximized")
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1920,1080")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     return webdriver.Chrome(options=options)
@@ -189,6 +193,12 @@ def recherche_automatique():
             lignes_medecins.append(row)
 
     print(f"Colonnes détectées dans {FICHIER_SOURCE} : {champs}")
+
+    # Ajoute la colonne 'statut' si elle n'existe pas encore dans le fichier source
+    if 'statut' not in champs:
+        champs.append('statut')
+        for row in lignes_medecins:
+            row.setdefault('statut', '')
 
     # Tolère la faute de frappe 'preenom' au lieu de 'prenom'
     cle_prenom = 'prenom' if 'prenom' in champs else ('preenom' if 'preenom' in champs else 'prenom')
