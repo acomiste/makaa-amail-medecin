@@ -4,11 +4,9 @@ import time
 import re
 import tempfile
 import threading
+from urllib.parse import quote_plus
 from selenium import webdriver
 from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
-from selenium.webdriver.support.ui import WebDriverWait
-from selenium.webdriver.support import expected_conditions as EC
 
 FICHIER_SOURCE = "medecins.csv"
 FICHIER_RESULTAT = "resultats_medecins.csv"
@@ -47,9 +45,12 @@ def extraire_emails_du_texte_page(texte_brut):
 
 def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
     """
-    Réécrit le fichier source SANS jamais risquer de le vider.
-    Écriture dans un fichier temporaire puis remplacement atomique.
-    Protégé par verrou_fichier car appelé depuis plusieurs threads.
+    Met à jour medecins.csv DIRECTEMENT, sans conserver de copie de sauvegarde.
+    Pour éviter de vider le fichier en cas d'erreur en cours d'écriture, on
+    écrit d'abord dans un fichier temporaire (dans le même dossier), puis on
+    remplace l'original de façon atomique (os.replace). Le fichier temporaire
+    n'existe que le temps de l'écriture : il est soit renommé en medecins.csv
+    (succès), soit supprimé (échec) — aucun fichier .bak ni copie ne subsiste.
     """
     with verrou_fichier:
         dossier = os.path.dirname(os.path.abspath(FICHIER_SOURCE)) or "."
@@ -59,7 +60,7 @@ def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
                 writer_src = csv.DictWriter(f_tmp, fieldnames=champs, delimiter=';', extrasaction='ignore')
                 writer_src.writeheader()
                 writer_src.writerows(lignes_medecins)
-            os.replace(chemin_temp, FICHIER_SOURCE)
+            os.replace(chemin_temp, FICHIER_SOURCE)  # remplace medecins.csv directement
         except Exception as e:
             print(f"⚠️ Erreur lors de la sauvegarde du fichier source, données préservées : {e}")
             if os.path.exists(chemin_temp):
@@ -117,32 +118,14 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
 
     print(f"[{nom_thread}] Scan en cours : {prenom} {nom}...")
 
-    driver.get("https://google.com")
-    time.sleep(1.5)
-
-    try:
-        bouton_cookies = driver.find_element(
-            By.XPATH, '//button[contains(., "Tout accepter") or contains(., "I agree")]'
-        )
-        bouton_cookies.click()
-        time.sleep(0.5)
-    except Exception:
-        pass
+    mots_cles = '(cpts OR msp OR sisa OR thèse OR ird OR @gmail.com OR @orange.fr)'
+    requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
+    url_recherche = f"https://html.duckduckgo.com/html/?q={quote_plus(requete_complete)}"
 
     email_sauvegarde = "Non disponible"
     try:
-        barre_saisie = WebDriverWait(driver, 5).until(
-            EC.presence_of_element_located((By.NAME, "q"))
-        )
-        mots_cles = '(cpts OR msp OR sisa OR thèse OR ird OR @gmail.com OR @orange.fr)'
-        requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
-
-        barre_saisie.clear()
-        barre_saisie.send_keys(requete_complete)
-        time.sleep(0.5)
-        barre_saisie.send_keys(Keys.ENTER)
-
-        time.sleep(3)
+        driver.get(url_recherche)
+        time.sleep(2)
 
         contenu_page = driver.find_element(By.TAG_NAME, "body").text
         mails_detectes = extraire_emails_du_texte_page(contenu_page)
