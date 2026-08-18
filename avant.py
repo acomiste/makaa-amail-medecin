@@ -53,7 +53,6 @@ def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
         dossier = os.path.dirname(os.path.abspath(FICHIER_SOURCE)) or "."
         fd, chemin_temp = tempfile.mkstemp(prefix="medecins_tmp_", suffix=".csv", dir=dossier)
         try:
-            # Sauvegarde forcée en utf-8 pour normaliser le fichier au fur et à mesure
             with os.fdopen(fd, mode='w', encoding='utf-8', newline='') as f_tmp:
                 writer_src = csv.DictWriter(f_tmp, fieldnames=champs, delimiter=';', extrasaction='ignore')
                 writer_src.writeheader()
@@ -119,6 +118,8 @@ def collecter_liens_ddg(driver):
     except:
         pass
     return liens_trouves
+
+
 def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     prenom = medecin.get(cle_prenom, '').strip()
     nom = medecin.get(cle_nom, '').strip()
@@ -131,11 +132,13 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
 
     urls_a_visiter = []
 
+    # --- ÉTAPE 1 : COLLECTE DES LIENS (PAGE 1) ---
     try:
         driver.get(url_initiale)
         time.sleep(2)
         urls_a_visiter.extend(collecter_liens_ddg(driver))
 
+        # --- NAVIGATION VERS PAGE 2 ---
         try:
             bouton_suivant = driver.find_element(By.XPATH, '//input[@type="submit" and (@value="Next" or @value="Suivant" or contains(@class, "nav-btn"))]')
             bouton_suivant.click()
@@ -152,6 +155,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     email_trouve = "Non disponible"
     url_source_finale = f"https://html.duckduckgo.com/html/?q={quote_plus(requete_complete)}"
 
+    # --- ÉTAPE 2 : VISITE INDIVIDUELLE DES SITES WEB POUR CHERCHER LE MAIL ---
     if urls_a_visiter:
         print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser pour ce médecin.")
         
@@ -171,6 +175,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
                     url_source_finale = url
                     print(f"[{nom_thread}] -> [SUCCÈS] Mail trouvé directement sur : {url}")
                     break
+
             except:
                 continue
     else:
@@ -202,32 +207,14 @@ def recherche_automatique():
         return
 
     lignes_medecins = []
-    
-    # Tentative de lecture robuste : teste l'utf-8, bascule sur latin-1 en cas d'erreur ANSI
-    try:
-        with open(FICHIER_SOURCE, mode='r', encoding='utf-8-sig') as f:
-            reader = csv.DictReader(f, delimiter=';')
-            champs = list(reader.fieldnames) if reader.fieldnames else []
-            for row in reader:
-                lignes_medecins.append(row)
-    except UnicodeDecodeError:
-        print(f"-> Détection d'un encodage ANSI/Windows. Bascule sur le décodeur compatible...")
-        lignes_medecins = []
-        with open(FICHIER_SOURCE, mode='r', encoding='latin-1') as f:
-            reader = csv.DictReader(f, delimiter=';')
-            champs = list(reader.fieldnames) if reader.fieldnames else []
-            for row in reader:
-                lignes_medecins.append(row)
+    with open(FICHIER_SOURCE, mode='r', encoding='utf-8-sig') as f:
+        reader = csv.DictReader(f, delimiter=';')
+        champs = list(reader.fieldnames)
+        for row in reader:
+            lignes_medecins.append(row)
 
     print(f"Colonnes détectées dans {FICHIER_SOURCE} : {champs}")
 
-    if not champs:
-        print("Erreur : Impossible de lire les en-têtes du fichier CSV.")
-        return
-
-    # Nettoyage des clés d'en-tête (enlever les espaces ou fautes résiduelles)
-    champs = [c.strip().lower() for c in champs]
-    
     if 'statut' not in champs:
         champs.append('statut')
         for row in lignes_medecins:
@@ -236,13 +223,13 @@ def recherche_automatique():
     cle_prenom = 'prenom' if 'prenom' in champs else ('preenom' if 'preenom' in champs else 'prenom')
     cle_nom = 'nom' if 'nom' in champs else 'nom'
 
-    medecins_a_traiter = [m for m in lignes_medecins if str(m.get('statut', '')).strip().lower() != 'traité']
+    medecins_a_traiter = [m for m in lignes_medecins if m.get('statut', '').strip().lower() != 'traité']
 
     if not medecins_a_traiter:
         print("Tous les médecins ont déjà été marqués comme 'Traité' !")
         return
 
-    print(f"--- Début de l'analyse globale : {len(medecins_a_traiter)} médecin(s) restant(s) ---")
+    print(f"--- Début de l'analyse approfondie : {len(medecins_a_traiter)} médecin(s) restant(s) ---")
 
     threads = []
     for i in range(NB_THREADS):
@@ -260,8 +247,9 @@ def recherche_automatique():
     for t in threads:
         t.join()
 
-    print("\n--- Extraction terminée ! ---")
+    print("\n--- Extraction terminée. Vos vraies URL sources sont dans 'resultats_medecins.csv' ! ---")
 
 
 if __name__ == "__main__":
     recherche_automatique()
+s
