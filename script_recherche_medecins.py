@@ -15,9 +15,14 @@ NB_THREADS = 2          # nombre de médecins traités simultanément
 PAUSE_TOUS_LES_N = 50   # déclenche une pause tous les N médecins traités (au total)
 DUREE_PAUSE = 120       # durée de la pause en secondes (2 minutes)
 
+# True  = navigateur invisible (à utiliser sur GitHub Actions, pas d'écran)
+# False = navigateur visible (à utiliser en local pour voir ce qui se passe)
+MODE_HEADLESS = os.environ.get("RUN_HEADLESS", "false").lower() == "true"
+
 # --- Verrous partagés entre threads ---
 verrou_fichier = threading.Lock()   # protège l'écriture des CSV
 verrou_etat = threading.Lock()      # protège le compteur / la pause globale
+verrou_demarrage_driver = threading.Lock()  # évite que 2 Chrome démarrent en même temps
 
 etat_global = {
     'compteur': 0,
@@ -44,14 +49,6 @@ def extraire_emails_du_texte_page(texte_brut):
 
 
 def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
-    """
-    Met à jour medecins.csv DIRECTEMENT, sans conserver de copie de sauvegarde.
-    Pour éviter de vider le fichier en cas d'erreur en cours d'écriture, on
-    écrit d'abord dans un fichier temporaire (dans le même dossier), puis on
-    remplace l'original de façon atomique (os.replace). Le fichier temporaire
-    n'existe que le temps de l'écriture : il est soit renommé en medecins.csv
-    (succès), soit supprimé (échec) — aucun fichier .bak ni copie ne subsiste.
-    """
     with verrou_fichier:
         dossier = os.path.dirname(os.path.abspath(FICHIER_SOURCE)) or "."
         fd, chemin_temp = tempfile.mkstemp(prefix="medecins_tmp_", suffix=".csv", dir=dossier)
@@ -60,7 +57,7 @@ def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
                 writer_src = csv.DictWriter(f_tmp, fieldnames=champs, delimiter=';', extrasaction='ignore')
                 writer_src.writeheader()
                 writer_src.writerows(lignes_medecins)
-            os.replace(chemin_temp, FICHIER_SOURCE)  # remplace medecins.csv directement
+            os.replace(chemin_temp, FICHIER_SOURCE)
         except Exception as e:
             print(f"⚠️ Erreur lors de la sauvegarde du fichier source, données préservées : {e}")
             if os.path.exists(chemin_temp):
@@ -75,7 +72,6 @@ def ajouter_resultat(prenom, nom, email, url):
 
 
 def attendre_si_pause_en_cours():
-    """Si une pause globale est active, attend qu'elle se termine."""
     with verrou_etat:
         pause_jusqu_a = etat_global['pause_jusqu_a']
     maintenant = time.time()
@@ -86,11 +82,6 @@ def attendre_si_pause_en_cours():
 
 
 def signaler_medecin_traite(nom_thread):
-    """
-    Incrémente le compteur global. Toutes les PAUSE_TOUS_LES_N fiches
-    traitées (tous threads confondus), déclenche une pause de DUREE_PAUSE
-    secondes pour TOUS les threads.
-    """
     with verrou_etat:
         etat_global['compteur'] += 1
         compteur_actuel = etat_global['compteur']
@@ -102,46 +93,95 @@ def signaler_medecin_traite(nom_thread):
 
 def creer_driver():
     options = webdriver.ChromeOptions()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1920,1080")
+    if MODE_HEADLESS:
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        options.add_argument("--window-size=1920,1080")
+    else:
+        options.add_argument("--start-maximized")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
-    return webdriver.Chrome(options=options)
+    with verrou_demarrage_driver:
+        return webdriver.Chrome(options=options)
+
+
+def collecter_liens_ddg(driver):
+    liens_trouves = []
+    try:
+        elements = driver.find_elements(By.CLASS_NAME, "result__url")
+        for elem in elements:
+            href = elem.get_attribute("href")
+            if href and "duckduckgo.com" not in href:
+                liens_trouves.append(href)
+    except:
+        pass
+    return liens_trouves
 
 
 def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     prenom = medecin.get(cle_prenom, '').strip()
     nom = medecin.get(cle_nom, '').strip()
 
-    print(f"[{nom_thread}] Scan en cours : {prenom} {nom}...")
+    print(f"[{nom_thread}] Extraction en cours : {prenom} {nom}...")
 
     mots_cles = '(cpts OR msp OR sisa OR thèse OR ird OR @gmail.com OR @orange.fr)'
     requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
-    url_recherche = f"https://html.duckduckgo.com/html/?q={quote_plus(requete_complete)}"
+    url_initiale = f"https://html.duckduckgo.com/html/?q={quote_plus(requete_complete)}"
 
-    email_sauvegarde = "Non disponible"
+    urls_a_visiter = []
+
+    # --- ÉTAPE 1 : COLLECTE DES LIENS (PAGE 1) ---
     try:
-        driver.get(url_recherche)
+        driver.get(url_initiale)
         time.sleep(2)
+        urls_a_visiter.extend(collecter_liens_ddg(driver))
 
-        contenu_page = driver.find_element(By.TAG_NAME, "body").text
-        mails_detectes = extraire_emails_du_texte_page(contenu_page)
-
-        if mails_detectes:
-            email_sauvegarde = " ; ".join(mails_detectes)
-            print(f"[{nom_thread}] -> [OK] Trouvé : {email_sauvegarde}")
-        else:
-            print(f"[{nom_thread}] -> Pas de mail visible sur cette page.")
+        # --- NAVIGATION VERS PAGE 2 ---
+        try:
+            bouton_suivant = driver.find_element(By.XPATH, '//input[@type="submit" and (@value="Next" or @value="Suivant" or contains(@class, "nav-btn"))]')
+            bouton_suivant.click()
+            time.sleep(2)
+            urls_a_visiter.extend(collecter_liens_ddg(driver))
+        except:
+            pass
 
     except Exception as e:
-        print(f"[{nom_thread}] Erreur lors du traitement de la page : {e}")
+        print(f"[{nom_thread}] Erreur lors de la lecture des résultats DuckDuckGo : {e}")
 
-    url_source_actuelle = driver.current_url
-    ajouter_resultat(prenom, nom, email_sauvegarde, url_source_actuelle)
+    urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
 
+    email_trouve = "Non disponible"
+    url_source_finale = f"https://html.duckduckgo.com/html/?q={quote_plus(requete_complete)}"
+
+    # --- ÉTAPE 2 : VISITE INDIVIDUELLE DES SITES WEB POUR CHERCHER LE MAIL ---
+    if urls_a_visiter:
+        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser pour ce médecin.")
+        
+        for url in urls_a_visiter:
+            try:
+                if any(excl in url.lower() for excl in ["pagesjaunes", "mappy", "facebook", "linkedin", "twitter"]):
+                    continue
+
+                driver.get(url)
+                time.sleep(2)
+
+                texte_site = driver.find_element(By.TAG_NAME, "body").text
+                mails_site = extraire_emails_du_texte_page(texte_site)
+
+                if mails_site:
+                    email_trouve = " ; ".join(mails_site)
+                    url_source_finale = url
+                    print(f"[{nom_thread}] -> [SUCCÈS] Mail trouvé directement sur : {url}")
+                    break
+
+            except:
+                continue
+    else:
+        print(f"[{nom_thread}] -> Aucun site web externe détecté sur DuckDuckGo.")
+
+    ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
     medecin['statut'] = 'Traité'
 
 
@@ -155,7 +195,6 @@ def travail_thread(nom_thread, medecins_assignes, champs, cle_prenom, cle_nom, l
             except Exception as e:
                 print(f"[{nom_thread}] Interruption inattendue sur une fiche : {e}")
             finally:
-                # Sauvegarde après chaque fiche, même en cas d'erreur partielle
                 sauvegarder_source_de_maniere_sure(champs, lignes_medecins)
                 signaler_medecin_traite(nom_thread)
     finally:
@@ -168,7 +207,6 @@ def recherche_automatique():
         return
 
     lignes_medecins = []
-    # encoding='utf-8-sig' : supprime le BOM éventuel (fichiers Excel)
     with open(FICHIER_SOURCE, mode='r', encoding='utf-8-sig') as f:
         reader = csv.DictReader(f, delimiter=';')
         champs = list(reader.fieldnames)
@@ -177,37 +215,31 @@ def recherche_automatique():
 
     print(f"Colonnes détectées dans {FICHIER_SOURCE} : {champs}")
 
-    # Ajoute la colonne 'statut' si elle n'existe pas encore dans le fichier source
     if 'statut' not in champs:
         champs.append('statut')
         for row in lignes_medecins:
             row.setdefault('statut', '')
 
-    # Tolère la faute de frappe 'preenom' au lieu de 'prenom'
     cle_prenom = 'prenom' if 'prenom' in champs else ('preenom' if 'preenom' in champs else 'prenom')
     cle_nom = 'nom' if 'nom' in champs else 'nom'
-    if cle_prenom != 'prenom':
-        print(f"⚠️ Colonne prénom détectée sous le nom '{cle_prenom}' — prise en compte automatiquement.")
 
-    medecins_restants = [m for m in lignes_medecins if m.get('statut', '').strip().lower() != 'traité'
-                          and m.get(cle_prenom, '').strip() and m.get(cle_nom, '').strip()]
+    medecins_a_traiter = [m for m in lignes_medecins if m.get('statut', '').strip().lower() != 'traité']
 
-    if not medecins_restants:
-        print("Tous les médecins ont déjà été traités !")
+    if not medecins_a_traiter:
+        print("Tous les médecins ont déjà été marqués comme 'Traité' !")
         return
 
-    print(f"--- Lancement du scan ({NB_THREADS} en parallèle, pause {DUREE_PAUSE // 60}min "
-          f"tous les {PAUSE_TOUS_LES_N}) — Reste : {len(medecins_restants)} médecin(s) ---")
-
-    # Répartition round-robin entre les threads (charge équilibrée)
-    lots = [medecins_restants[i::NB_THREADS] for i in range(NB_THREADS)]
+    print(f"--- Début de l'analyse approfondie : {len(medecins_a_traiter)} médecin(s) restant(s) ---")
 
     threads = []
-    for i, lot in enumerate(lots):
-        nom_thread = f"Thread-{i+1}"
+    for i in range(NB_THREADS):
+        lot_thread = medecins_a_traiter[i::NB_THREADS]
+        if not lot_thread:
+            continue
+        nom_t = f"Thread-{i+1}"
         t = threading.Thread(
-            target=travail_thread,
-            args=(nom_thread, lot, champs, cle_prenom, cle_nom, lignes_medecins),
+            target=travail_thread, 
+            args=(nom_t, lot_thread, champs, cle_prenom, cle_nom, lignes_medecins)
         )
         threads.append(t)
         t.start()
@@ -215,8 +247,9 @@ def recherche_automatique():
     for t in threads:
         t.join()
 
-    print("\n--- Session terminée. Les résultats ont été enregistrés. ---")
+    print("\n--- Extraction terminée. Vos vraies URL sources sont dans 'resultats_medecins.csv' ! ---")
 
 
 if __name__ == "__main__":
     recherche_automatique()
+s
