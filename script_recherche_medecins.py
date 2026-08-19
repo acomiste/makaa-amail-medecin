@@ -5,6 +5,7 @@ import re
 import tempfile
 import threading
 import sys
+import requests  # Requis pour la recherche stable de secours
 from urllib.parse import quote
 
 # Force Python à vider son buffer d'affichage immédiatement pour GitHub Actions
@@ -125,7 +126,6 @@ def creer_driver():
         options.add_argument("--disable-gpu")
         options.add_argument("--remote-debugging-pipe")
         options.add_argument("--window-size=1920,1080")
-        options.add_argument("--dns-prefetch-disable")  # Évite les erreurs de résolution DNS sous Linux
     else:
         options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
@@ -150,18 +150,38 @@ def verifier_si_captcha(driver, nom_thread, prenom, nom):
     return False
 
 
-def collecter_liens_ddg(driver):
-    liens_trouves = []
-    # Recherche élargie des balises de liens dans le document brut
+def executer_recherche_http_robuste(requete):
+    """Effectue une recherche HTTP brute via DuckDuckGo HTML ou Google en secours en cas de crash DNS."""
+    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
+    liens_extraits = []
+    
+    # 1. Tentative sur l'endpoint léger DuckDuckGo (Sans passer par Selenium)
     try:
-        elements = driver.find_elements(By.TAG_NAME, "a")
-        for elem in elements:
-            href = elem.get_attribute("href")
-            if href and "duckduckgo.com" not in href and href.startswith("http") and href not in liens_trouves:
-                liens_trouves.append(href)
+        url_ddg = f"https://duckduckgo.com{quote(requete)}"
+        res = requests.get(url_ddg, headers=headers, timeout=10)
+        if res.status_code == 200:
+            liens_extraits.extend(re.findall(r'href="(https?://[^"]+)"', res.text))
     except:
         pass
-    return liens_trouves
+
+    # 2. SECOURS CRITIQUE : Si DDG a un problème DNS ou bloque, on interroge Google HTML en brut
+    if not liens_extraits:
+        try:
+            url_google = f"https://google.com{quote(requete)}"
+            res = requests.get(url_google, headers=headers, timeout=10)
+            if res.status_code == 200:
+                liens_extraits.extend(re.findall(r'/url\?q=(https?://[^&]+)', res.text))
+        except:
+            pass
+
+    # Nettoyage et filtrage des liens internes
+    liens_propres = []
+    for url in liens_extraits:
+        if not any(x in url.lower() for x in ["duckduckgo", "google", "w3.org", "adobe", "pappers"]):
+            if url.startswith("http") and url not in liens_propres:
+                liens_propres.append(url)
+                
+    return liens_propres[:3]
 
 
 def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
@@ -174,33 +194,19 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     mots_cles = "cpts msp sisa thèse"
     requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
     
-    # SOLUTION : Utilisation de l'endpoint d.js (alternative très stable sans script lourd)
-    url_initiale = f"https://duckduckgo.com{quote(requete_complete)}"
-    urls_a_visiter = []
+    # Récupération des sites via notre fonction HTTP immunisée contre l'erreur de driver Selenium
+    urls_a_visiter = executer_recherche_http_robuste(requete_complete)
 
-    try:
-        driver.get(url_initiale)
-        time.sleep(3)
-        
-        if verifier_si_captcha(driver, nom_thread, prenom, nom):
-            ajouter_resultat(prenom, nom, "Bloqué par Captcha (Moteur)", url_initiale)
-            medecin['statut'] = 'Traité'
-            return
-
-        urls_a_visiter.extend(collecter_liens_ddg(driver))
-    except Exception as e:
-        print(f"    ⚠️ [{nom_thread}] Incident réseau sur DuckDuckGo (Saut de ligne) : {e}", flush=True)
-
-    urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
     email_trouve = "Non disponible"
-    url_source_finale = url_initiale
+    url_source_finale = f"https://duckduckgo.com{quote(requete_complete)}"
 
     if urls_a_visiter:
-        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser.", flush=True)
+        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web détecté(s). Analyse en cours...", flush=True)
         for url in urls_a_visiter:
             try:
                 if any(excl in url.lower() for excl in ["pagesjaunes", "mappy", "facebook", "linkedin", "twitter"]):
                     continue
+                    
                 driver.get(url)
                 time.sleep(2)
 
@@ -218,7 +224,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
             except:
                 continue
     else:
-        print(f"[{nom_thread}] -> Aucun site web externe détecté ou accessible.", flush=True)
+        print(f"[{nom_thread}] -> Aucun site web externe détecté (Moteurs saturés).", flush=True)
 
     ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
     medecin['statut'] = 'Traité'
@@ -289,7 +295,7 @@ if __name__ == "__main__":
         )
         threads_actifs.append(t)
         t.start()
-        time.sleep(2.0)  # Délai augmenté pour stabiliser l'accès réseau initial
+        time.sleep(2.0)
 
     for t in threads_actifs:
         t.join()
