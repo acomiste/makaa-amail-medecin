@@ -21,23 +21,24 @@ jobs:
         with:
           python-version: '3.11'
 
+      # CORRECTION 1 : Passage à la version v2 stable pour supporter Selenium 4
       - name: Installer Google Chrome
-        uses: browser-actions/setup-chrome@v1
+        uses: browser-actions/setup-chrome@v2
         with:
           chrome-version: stable
 
+      # CORRECTION 2 : Ajout explicite de la bibliothèque nécessaire au script
       - name: Installer les dépendances Python
         run: |
           python -m pip install --upgrade pip
-          pip install selenium
+          pip install selenium requests
 
+      # CORRECTION 3 : Forçage de l'environnement Python non-bufferisé global
       - name: Lancer le script (mode headless)
         run: python script_recherche_medecins.py
         env:
-          # Force le mode headless côté script — voir la note ci-dessous :
-          # il faut adapter le script pour lire cette variable et ajouter
-          # options.add_argument("--headless=new") en conséquence.
           RUN_HEADLESS: "true"
+          PYTHONUNBUFFERED: "1"  # Force l'affichage du texte sur GitHub à la milliseconde près
 
       - name: Sauvegarder les fichiers CSV en résultat (artifact)
         uses: actions/upload-artifact@v4

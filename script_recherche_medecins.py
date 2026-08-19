@@ -4,7 +4,11 @@ import time
 import re
 import tempfile
 import threading
+import sys  # Requis pour forcer l'affichage immédiat des logs
 from urllib.parse import quote
+
+# Force Python à vider son buffer d'affichage immédiatement pour GitHub Actions
+sys.stdout.reconfigure(line_buffering=True)
 
 FICHIER_SOURCE = "medecins.csv"
 FICHIER_RESULTAT = "resultats_medecins.csv"
@@ -30,7 +34,7 @@ etat_global = {
 
 def initialiser_fichiers():
     if not os.path.exists(FICHIER_SOURCE):
-        print(f"Erreur : Le fichier '{FICHIER_SOURCE}' est introuvable.")
+        print(f"Erreur : Le fichier '{FICHIER_SOURCE}' est introuvable.", flush=True)
         return False
     if not os.path.exists(FICHIER_RESULTAT):
         with open(FICHIER_RESULTAT, mode='w', encoding='utf-8', newline='') as f:
@@ -49,7 +53,7 @@ def lire_csv_avec_fallback_encodage(chemin_fichier):
                 reader = csv.DictReader(f, delimiter=';')
                 champs = list(reader.fieldnames)
                 lignes = list(reader)
-            print(f"Fichier '{chemin_fichier}' lu avec succès en encodage : {enc}")
+            print(f"Fichier '{chemin_fichier}' lu avec succès en encodage : {enc}", flush=True)
             return champs, lignes
         except UnicodeDecodeError as e:
             derniere_erreur = e
@@ -79,7 +83,7 @@ def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
                 writer_src.writerows(lignes_medecins)
             os.replace(chemin_temp, FICHIER_SOURCE)
         except Exception as e:
-            print(f"⚠️ Erreur lors de la sauvegarde du fichier source, données préservées : {e}")
+            print(f"⚠️ Erreur lors de la sauvegarde du fichier source : {e}", flush=True)
             if os.path.exists(chemin_temp):
                 os.remove(chemin_temp)
 
@@ -97,7 +101,7 @@ def attendre_si_pause_en_cours():
     maintenant = time.time()
     if maintenant < pause_jusqu_a:
         attente = pause_jusqu_a - maintenant
-        print(f"⏸ [Pause globale] {int(attente)}s restantes...")
+        print(f"⏸ [Pause globale] {int(attente)}s restantes...", flush=True)
         time.sleep(attente)
 
 
@@ -108,7 +112,7 @@ def signaler_medecin_traite(nom_thread):
         if compteur_actuel % PAUSE_TOUS_LES_N == 0:
             etat_global['pause_jusqu_a'] = time.time() + DUREE_PAUSE
             print(f"\n🛑 [{nom_thread}] {compteur_actuel} médecins traités au total. "
-                  f"Pause de {DUREE_PAUSE // 60} minute(s) pour tous les threads...\n")
+                  f"Pause de {DUREE_PAUSE // 60} minute(s) pour tous les threads...\n", flush=True)
 
 
 def creer_driver():
@@ -119,6 +123,8 @@ def creer_driver():
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
+        # Évite le blocage de communication avec Chrome sous Linux
+        options.add_argument("--remote-debugging-pipe")
         options.add_argument("--window-size=1920,1080")
     else:
         options.add_argument("--start-maximized")
@@ -127,3 +133,164 @@ def creer_driver():
     options.add_experimental_option('useAutomationExtension', False)
     with verrou_demarrage_driver:
         return webdriver.Chrome(options=options)
+def verifier_si_captcha(driver, nom_thread, prenom, nom):
+    mots_cles_bloquants = [
+        "captcha", "g-recaptcha", "cloudflare", "hcaptcha", "checking your browser",
+        "please verify you are a robot", "pas un robot", "automated access"
+    ]
+    try:
+        html_page = driver.page_source.lower()
+        url_actuelle = driver.current_url.lower()
+        for mot in mots_cles_bloquants:
+            if mot in html_page or mot in url_actuelle:
+                print(f"\n🛑 [{nom_thread}] [ALERTE CAPTCHA DETECTÉ] pour Dr {prenom} {nom} via : '{mot}'", flush=True)
+                return True
+    except:
+        pass
+    return False
+
+
+def collecter_liens_ddg(driver):
+    liens_trouves = []
+    selectors = ["[data-testid='result-title-a']", ".result__url", "a[data-testid='result-extras-url-link']"]
+    for sel in selectors:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            for elem in elements:
+                href = elem.get_attribute("href")
+                if href and "duckduckgo.com" not in href and href not in liens_trouves:
+                    liens_trouves.append(href)
+        except:
+            continue
+    return liens_trouves
+
+
+def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
+    prenom = medecin.get(cle_prenom, '').strip()
+    nom = medecin.get(cle_nom, '').strip()
+
+    affichage_nom = f"{prenom} {nom}" if prenom.lower() != nom.lower() else nom
+    print(f"[{nom_thread}] Extraction en cours : {affichage_nom}...", flush=True)
+
+    mots_cles = "cpts msp sisa thèse"
+    requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
+    url_initiale = f"https://duckduckgo.com{quote(requete_complete)}"
+    urls_a_visiter = []
+
+    try:
+        driver.get(url_initiale)
+        time.sleep(3)
+        
+        if verifier_si_captcha(driver, nom_thread, prenom, nom):
+            ajouter_resultat(prenom, nom, "Bloqué par Captcha (Moteur)", url_initiale)
+            medecin['statut'] = 'Traité'
+            return
+
+        urls_a_visiter.extend(collecter_liens_ddg(driver))
+    except Exception as e:
+        print(f"[{nom_thread}] Erreur lors de la lecture de DuckDuckGo : {e}", flush=True)
+
+    urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
+    email_trouve = "Non disponible"
+    url_source_finale = url_initiale
+
+    if urls_a_visiter:
+        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser.", flush=True)
+        for url in urls_a_visiter:
+            try:
+                if any(excl in url.lower() for excl in ["pagesjaunes", "mappy", "facebook", "linkedin", "twitter"]):
+                    continue
+                driver.get(url)
+                time.sleep(2)
+
+                if verifier_si_captcha(driver, nom_thread, prenom, nom):
+                    continue
+
+                texte_site = driver.find_element(By.TAG_NAME, "body").text
+                mails_site = extraire_emails_du_texte_page(texte_site)
+
+                if mails_site:
+                    email_trouve = " ; ".join(mails_site)
+                    url_source_finale = url
+                    print(f"[{nom_thread}] -> [SUCCÈS] Mail trouvé sur : {url}", flush=True)
+                    break
+            except:
+                continue
+    else:
+        print(f"[{nom_thread}] -> Aucun site web externe détecté.", flush=True)
+
+    ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
+    medecin['statut'] = 'Traité'
+
+
+def travail_thread(champs, lignes_medecins, cle_prenom, cle_nom, nom_thread):
+    driver = None
+    try:
+        driver = creer_driver()
+        while True:
+            attendre_si_pause_en_cours()
+            medecin_a_traiter = None
+            
+            with verrou_etat:
+                for row in lignes_medecins:
+                    if row.get('statut', '').strip().lower() != 'traité':
+                        row['statut'] = 'Traité'
+                        medecin_a_traiter = row
+                        break
+            
+            if not medecin_a_traiter:
+                print(f"🏁 [{nom_thread}] Plus aucun médecin à traiter. Fermeture.", flush=True)
+                break
+                
+            try:
+                traiter_medecin(driver, medecin_a_traiter, cle_prenom, cle_nom, nom_thread)
+            except Exception as e:
+                print(f"❌ [{nom_thread}] Erreur inattendue sur une ligne : {e}", flush=True)
+                
+            sauvegarder_source_de_maniere_sure(champs, lignes_medecins)
+            signaler_medecin_traite(nom_thread)
+    finally:
+        if driver:
+            driver.quit()
+
+
+if __name__ == "__main__":
+    if not initialiser_fichiers():
+        exit(1)
+
+    print("📖 Chargement et analyse du fichier source...", flush=True)
+    champs, lignes_medecins = lire_csv_avec_fallback_encodage(FICHIER_SOURCE)
+
+    cle_prenom = next((c for c in champs if 'prénom' in c.lower() or 'prenom' in c.lower()), None)
+    cle_nom = next((c for c in champs if 'nom' in c.lower()), None)
+
+    if not cle_prenom or not cle_nom:
+        print(f"❌ Erreur : Colonnes 'Prénom' ou 'Nom' manquantes dans {FICHIER_SOURCE}.", flush=True)
+        exit(1)
+
+    if 'statut' not in champs:
+        champs.append('statut')
+
+    lignes_filtrées = [l for l in lignes_medecins if l.get('statut', '').strip().lower() != 'traité']
+    print(f"🔥 {len(lignes_filtrées)} médecin(s) restant(s) à extraire.", flush=True)
+
+    if not lignes_filtrées:
+        print("🏁 Tous les médecins de la liste ont déjà été marqués comme 'Traité'.", flush=True)
+        exit(0)
+
+    threads_actifs = []
+    for i in range(NB_THREADS):
+        nom_t = f"Thread-{i+1}"
+        t = threading.Thread(
+            target=travail_thread, 
+            args=(champs, lignes_medecins, cle_prenom, cle_nom, nom_t),
+            name=nom_t
+        )
+        threads_actifs.append(t)
+        t.start()
+        time.sleep(1.5)
+
+    for t in threads_actifs:
+        t.join()
+
+    print("\n🏁 [FIN DU SCRIPT] Exécution terminée.", flush=True)
