@@ -157,7 +157,7 @@ def executer_recherche_http_robuste(requete):
     
     # 1. Tentative sur l'endpoint léger DuckDuckGo (Sans passer par Selenium)
     try:
-        url_ddg = f"https://duckduckgo.com{quote(requete)}"
+        url_ddg = f"https://duckduckgo.com/?q={quote(requete)}"
         res = requests.get(url_ddg, headers=headers, timeout=10)
         if res.status_code == 200:
             liens_extraits.extend(re.findall(r'href="(https?://[^"]+)"', res.text))
@@ -167,7 +167,7 @@ def executer_recherche_http_robuste(requete):
     # 2. SECOURS CRITIQUE : Si DDG a un problème DNS ou bloque, on interroge Google HTML en brut
     if not liens_extraits:
         try:
-            url_google = f"https://google.com{quote(requete)}"
+            url_google = f"https://google.com/search?q={quote(requete)}"
             res = requests.get(url_google, headers=headers, timeout=10)
             if res.status_code == 200:
                 liens_extraits.extend(re.findall(r'/url\?q=(https?://[^&]+)', res.text))
@@ -198,7 +198,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     urls_a_visiter = executer_recherche_http_robuste(requete_complete)
 
     email_trouve = "Non disponible"
-    url_source_finale = f"https://duckduckgo.com{quote(requete_complete)}"
+    url_source_finale = f"https://duckduckgo.com/?q={quote(requete_complete)}"
 
     if urls_a_visiter:
         print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web détecté(s). Analyse en cours...", flush=True)
