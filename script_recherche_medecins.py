@@ -143,38 +143,56 @@ def verifier_si_captcha(driver, nom_thread, prenom, nom):
         url_actuelle = driver.current_url.lower()
         for mot in mots_cles_bloquants:
             if mot in html_page or mot in url_actuelle:
-                print(f"\n🛑 [{nom_thread}] [ALERTE CAPTCHA DETECTÉ] pour Dr {prenom} {nom} via : '{mot}'", flush=True)
+                print(f"\n╔════════════════════════════════════════════════════════════╗", flush=True)
+                print(f"  🛑 [{nom_thread}] [ALERTE CAPTCHA SUR SITE WEB EXTERNE] 🛑", flush=True)
+                print(f"  ⚠️  Le site visité pour Dr {prenom} {nom} bloque l'accès.", flush=True)
+                print(f"  🌐 URL : {driver.current_url}", flush=True)
+                print(f"╚════════════════════════════════════════════════════════════╝\n", flush=True)
                 return True
     except:
         pass
     return False
 
 
-def executer_recherche_http_robuste(requete):
-    """Effectue une recherche HTTP brute via DuckDuckGo HTML ou Google en secours en cas de crash DNS."""
+def executer_recherche_http_robuste(requete, nom_thread):
+    """Effectue une recherche textuelle et affiche une alerte si un Captcha moteur surgit."""
     headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'}
     liens_extraits = []
     
-    # 1. Tentative sur l'endpoint léger DuckDuckGo (Sans passer par Selenium)
+    # 1. Tentative sur DuckDuckGo HTML
     try:
         url_ddg = f"https://duckduckgo.com{quote(requete)}"
         res = requests.get(url_ddg, headers=headers, timeout=10)
-        if res.status_code == 200:
+        
+        # Détection de Captcha Moteur (Code 403 / 429 ou mot clé dans la page)
+        if res.status_code in [403, 429] or "captcha" in res.text.lower() or "anti-bot" in res.text.lower():
+            print(f"\n╔════════════════════════════════════════════════════════════╗", flush=True)
+            print(f"  🛑 [{nom_thread}] [CAPTCHA DÉTECTÉ SUR DUCKDUCKGO] 🛑", flush=True)
+            print(f"  ⚠️  DuckDuckGo bloque temporairement les requêtes de GitHub.", flush=True)
+            print(f"╚════════════════════════════════════════════════════════════╝\n", flush=True)
+        elif res.status_code == 200:
             liens_extraits.extend(re.findall(r'href="(https?://[^"]+)"', res.text))
-    except:
-        pass
+    except Exception as e:
+        print(f"    ℹ️ [{nom_thread}] DuckDuckGo indisponible (Tentative Secours Google...)", flush=True)
 
-    # 2. SECOURS CRITIQUE : Si DDG a un problème DNS ou bloque, on interroge Google HTML en brut
+    # 2. Secours sur Google HTML si DDG n'a rien renvoyé
     if not liens_extraits:
         try:
             url_google = f"https://google.com{quote(requete)}"
             res = requests.get(url_google, headers=headers, timeout=10)
-            if res.status_code == 200:
+            
+            # Détection de Captcha Moteur sur Google
+            if res.status_code in [403, 429] or "captcha" in res.text.lower() or "not_found_error" in res.text.lower():
+                print(f"\n╔════════════════════════════════════════════════════════════╗", flush=True)
+                print(f"  🛑 [{nom_thread}] [CAPTCHA DÉTECTÉ SUR GOOGLE SECOURS] 🛑", flush=True)
+                print(f"  ⚠️  Google bloque également l'adresse IP du serveur Cloud.", flush=True)
+                print(f"╚════════════════════════════════════════════════════════════╝\n", flush=True)
+            elif res.status_code == 200:
                 liens_extraits.extend(re.findall(r'/url\?q=(https?://[^&]+)', res.text))
         except:
             pass
 
-    # Nettoyage et filtrage des liens internes
+    # Filtrage des liens publicitaires/internes
     liens_propres = []
     for url in liens_extraits:
         if not any(x in url.lower() for x in ["duckduckgo", "google", "w3.org", "adobe", "pappers"]):
@@ -194,8 +212,8 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
     mots_cles = "cpts msp sisa thèse"
     requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
     
-    # Récupération des sites via notre fonction HTTP immunisée contre l'erreur de driver Selenium
-    urls_a_visiter = executer_recherche_http_robuste(requete_complete)
+    # Lancement de la recherche robuste avec détection intégrée
+    urls_a_visiter = executer_recherche_http_robuste(requete_complete, nom_thread)
 
     email_trouve = "Non disponible"
     url_source_finale = f"https://duckduckgo.com{quote(requete_complete)}"
@@ -224,7 +242,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
             except:
                 continue
     else:
-        print(f"[{nom_thread}] -> Aucun site web externe détecté (Moteurs saturés).", flush=True)
+        print(f"[{nom_thread}] -> Aucun site web externe analysable (Moteurs saturés ou bloqués).", flush=True)
 
     ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
     medecin['statut'] = 'Traité'
