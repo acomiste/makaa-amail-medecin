@@ -4,9 +4,7 @@ import time
 import re
 import tempfile
 import threading
-from urllib.parse import quote_plus
-from selenium import webdriver
-from selenium.webdriver.common.by import By
+from urllib.parse import quote
 
 FICHIER_SOURCE = "medecins.csv"
 FICHIER_RESULTAT = "resultats_medecins.csv"
@@ -42,7 +40,6 @@ def initialiser_fichiers():
 
 
 def lire_csv_avec_fallback_encodage(chemin_fichier):
-    """Essaie plusieurs encodages jusqu'à ce que la lecture réussisse."""
     encodages_a_tester = ['utf-8-sig', 'cp1252', 'latin-1']
     derniere_erreur = None
 
@@ -115,6 +112,7 @@ def signaler_medecin_traite(nom_thread):
 
 
 def creer_driver():
+    from selenium import webdriver
     options = webdriver.ChromeOptions()
     if MODE_HEADLESS:
         options.add_argument("--headless=new")
@@ -124,194 +122,8 @@ def creer_driver():
         options.add_argument("--window-size=1920,1080")
     else:
         options.add_argument("--start-maximized")
+    options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
     with verrou_demarrage_driver:
         return webdriver.Chrome(options=options)
-def verifier_si_captcha(driver, nom_thread, prenom, nom):
-    """Vérifie si la page actuelle contient un Captcha ou un blocage anti-robot."""
-    mots_cles_bloquants = [
-        "captcha", "g-recaptcha", "cloudflare", "hcaptcha", "checking your browser",
-        "please verify you are a robot", "pas un robot", "automated access"
-    ]
-    try:
-        html_page = driver.page_source.lower()
-        url_actuelle = driver.current_url.lower()
-        
-        for mot in mots_cles_bloquants:
-            if mot in html_page or mot in url_actuelle:
-                print(f"\n🛑 [{nom_thread}] [ALERTE CAPTCHA DETECTÉ] 🛑")
-                print(f"⚠️  Le traitement de Dr {prenom} {nom} a rencontré un système anti-robot via : '{mot}'")
-                print(f"🌐 URL cible actuelle : {driver.current_url}")
-                return True
-    except:
-        pass
-    return False
-
-
-def collecter_liens_ddg(driver):
-    liens_trouves = []
-    try:
-        elements = driver.find_elements(By.CLASS_NAME, "result__url")
-        for elem in elements:
-            href = elem.get_attribute("href")
-            if href and "duckduckgo.com" not in href:
-                liens_trouves.append(href)
-    except:
-        pass
-    return liens_trouves
-
-
-def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
-    prenom = medecin.get(cle_prenom, '').strip()
-    nom = medecin.get(cle_nom, '').strip()
-
-    print(f"[{nom_thread}] Extraction en cours : {prenom} {nom}...")
-
-    mots_cles = '(cpts OR msp OR sisa OR thèse OR ird OR @gmail.com OR @orange.fr)'
-    requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
-    url_initiale = f"https://duckduckgo.com{quote_plus(requete_complete)}"
-
-    urls_a_visiter = []
-
-    # --- ÉTAPE 1 : COLLECTE DES LIENS (PAGE 1) ---
-    try:
-        driver.get(url_initiale)
-        time.sleep(2)
-        
-        if verifier_si_captcha(driver, nom_thread, prenom, nom):
-            ajouter_resultat(prenom, nom, "Bloqué par Captcha (Moteur)", url_initiale)
-            medecin['statut'] = 'Traité'
-            return
-
-        urls_a_visiter.extend(collecter_liens_ddg(driver))
-
-        # --- NAVIGATION VERS PAGE 2 ---
-        try:
-            bouton_suivant = driver.find_element(By.XPATH, '//input[@type="submit" and (@value="Next" or @value="Suivant" or contains(@class, "nav-btn"))]')
-            bouton_suivant.click()
-            time.sleep(2)
-            
-            if verifier_si_captcha(driver, nom_thread, prenom, nom):
-                print(f"[{nom_thread}] -> Bloqué par Captcha sur la page 2 de DuckDuckGo.")
-            else:
-                urls_a_visiter.extend(collecter_liens_ddg(driver))
-        except:
-            pass
-
-    except Exception as e:
-        print(f"[{nom_thread}] Erreur lors de la lecture des résultats DuckDuckGo : {e}")
-
-    urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
-
-    email_trouve = "Non disponible"
-    url_source_finale = f"https://duckduckgo.com{quote_plus(requete_complete)}"
-
-    # --- ÉTAPE 2 : VISITE INDIVIDUELLE DES SITES WEB ---
-    if urls_a_visiter:
-        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser pour ce médecin.")
-
-        for url in urls_a_visiter:
-            try:
-                if any(excl in url.lower() for excl in ["pagesjaunes", "mappy", "facebook", "linkedin", "twitter"]):
-                    continue
-
-                driver.get(url)
-                time.sleep(2)
-
-                if verifier_si_captcha(driver, nom_thread, prenom, nom):
-                    print(f"[{nom_thread}] -> Le site web externe {url} a déclenché un Captcha. Passage au suivant.")
-                    continue
-
-                texte_site = driver.find_element(By.TAG_NAME, "body").text
-                mails_site = extraire_emails_du_texte_page(texte_site)
-
-                if mails_site:
-                    email_trouve = " ; ".join(mails_site)
-                    url_source_finale = url
-                    print(f"[{nom_thread}] -> [SUCCÈS] Mail trouvé directement sur : {url}")
-                    break
-
-            except:
-                continue
-    else:
-        print(f"[{nom_thread}] -> Aucun site web externe détecté sur DuckDuckGo.")
-
-    ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
-    medecin['statut'] = 'Traité'
-
-
-def travail_thread(champs, lignes_medecins, cle_prenom, cle_nom, nom_thread):
-    """Boucle de fond gérée par chaque thread pour dépiler la liste."""
-    driver = None
-    try:
-        driver = creer_driver()
-        
-        while True:
-            attendre_si_pause_en_cours()
-            medecin_a_traiter = None
-            
-            with verrou_etat:
-                for row in lignes_medecins:
-                    if row.get('statut', '').strip().lower() != 'traité':
-                        row['statut'] = 'Traité'  # Verrouille immédiatement la ligne
-                        medecin_a_traiter = row
-                        break
-            
-            if not medecin_a_traiter:
-                print(f"🏁 [{nom_thread}] Plus aucun médecin à traiter dans la liste. Fermeture.")
-                break
-                
-            try:
-                traiter_medecin(driver, medecin_a_traiter, cle_prenom, cle_nom, nom_thread)
-            except Exception as e:
-                print(f"❌ [{nom_thread}] Erreur critique inattendue sur une ligne : {e}")
-                
-            sauvegarder_source_de_maniere_sure(champs, lignes_medecins)
-            signaler_medecin_traite(nom_thread)
-            
-    finally:
-        if driver:
-            driver.quit()
-
-
-if __name__ == "__main__":
-    if not initialiser_fichiers():
-        exit(1)
-
-    print("📖 Chargement et analyse du fichier source...")
-    champs, lignes_medecins = lire_csv_avec_fallback_encodage(FICHIER_SOURCE)
-
-    cle_prenom = next((c for c in champs if 'prénom' in c.lower() or 'prenom' in c.lower()), None)
-    cle_nom = next((c for c in champs if 'nom' in c.lower()), None)
-
-    if not cle_prenom or not cle_nom:
-        print(f"❌ Erreur : Colonnes 'Prénom' ou 'Nom' manquantes dans {FICHIER_SOURCE}.")
-        exit(1)
-
-    if 'statut' not in champs:
-        champs.append('statut')
-
-    lignes_filtrées = [l for l in lignes_medecins if l.get('statut', '').strip().lower() != 'traité']
-    print(f"🔥 {len(lignes_filtrées)} médecin(s) restant(s) à extraire.")
-
-    if not lignes_filtrées:
-        print("🏁 Tous les médecins de la liste ont déjà été marqués comme 'Traité'.")
-        exit(0)
-
-    threads_actifs = []
-    for i in range(NB_THREADS):
-        nom_t = f"Thread-{i+1}"
-        t = threading.Thread(
-            target=travail_thread, 
-            args=(champs, lignes_medecins, cle_prenom, cle_nom, nom_t),
-            name=nom_t
-        )
-        threads_actifs.append(t)
-        t.start()
-        time.sleep(1.5)
-
-    for t in threads_actifs:
-        t.join()
-
-    print("\n🏁 [FIN DU SCRIPT] Exécution terminée.")
