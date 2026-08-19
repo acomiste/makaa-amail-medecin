@@ -1,200 +1,296 @@
-import io
 import os
-import re
+import csv
 import time
-import requests
+import re
+import tempfile
 import threading
-import csv  # Importation du module CSV pour une écriture propre
-from concurrent.futures import ThreadPoolExecutor
-from pypdf import PdfReader
+import sys  # Requis pour forcer l'affichage immédiat des logs
+from urllib.parse import quote
 
-from selenium import webdriver
-from selenium.webdriver.common.by import By
-from selenium.webdriver.common.keys import Keys
+# Force Python à vider son buffer d'affichage immédiatement pour GitHub Actions
+sys.stdout.reconfigure(line_buffering=True)
 
-# Verrou de sécurité pour éviter les conflits d'écriture simultanée dans le fichier CSV
-verrou_fichier = threading.Lock()
+FICHIER_SOURCE = "medecins.csv"
+FICHIER_RESULTAT = "resultats_medecins.csv"
 
-def initialiser_navigateur():
-    """Lance Google Chrome adapté à l'environnement d'exécution (Local ou GitHub)."""
+NB_THREADS = 2          # nombre de médecins traités simultanément
+PAUSE_TOUS_LES_N = 50   # déclenche une pause tous les N médecins traités (au total)
+DUREE_PAUSE = 120       # durée de la pause en secondes (2 minutes)
+
+# True  = navigateur invisible (à utiliser sur GitHub Actions, pas d'écran)
+# False = navigateur visible (à utiliser en local pour voir ce qui se passe)
+MODE_HEADLESS = os.environ.get("RUN_HEADLESS", "false").lower() == "true"
+
+# --- Verrous partagés entre threads ---
+verrou_fichier = threading.Lock()   # protège l'écriture des CSV
+verrou_etat = threading.Lock()      # protège le compteur / la pause globale
+verrou_demarrage_driver = threading.Lock()  # évite que 2 Chrome démarrent en même temps
+
+etat_global = {
+    'compteur': 0,
+    'pause_jusqu_a': 0.0,
+}
+
+
+def initialiser_fichiers():
+    if not os.path.exists(FICHIER_SOURCE):
+        print(f"Erreur : Le fichier '{FICHIER_SOURCE}' est introuvable.", flush=True)
+        return False
+    if not os.path.exists(FICHIER_RESULTAT):
+        with open(FICHIER_RESULTAT, mode='w', encoding='utf-8', newline='') as f:
+            writer = csv.writer(f, delimiter=';')
+            writer.writerow(['Prénom', 'Nom', 'Email trouvé sur le web', 'URL Source'])
+    return True
+
+
+def lire_csv_avec_fallback_encodage(chemin_fichier):
+    encodages_a_tester = ['utf-8-sig', 'cp1252', 'latin-1']
+    derniere_erreur = None
+
+    for enc in encodages_a_tester:
+        try:
+            with open(chemin_fichier, mode='r', encoding=enc, newline='') as f:
+                reader = csv.DictReader(f, delimiter=';')
+                champs = list(reader.fieldnames)
+                lignes = list(reader)
+            print(f"Fichier '{chemin_fichier}' lu avec succès en encodage : {enc}", flush=True)
+            return champs, lignes
+        except UnicodeDecodeError as e:
+            derniere_erreur = e
+            continue
+
+    raise UnicodeDecodeError(
+        "utf-8", b"", 0, 1,
+        f"Impossible de lire {chemin_fichier} avec les encodages testés {encodages_a_tester} : {derniere_erreur}"
+    )
+
+
+def extraire_emails_du_texte_page(texte_brut):
+    motif = r'[a-zA-Z0-9_.-]+@[a-zA-Z0-9_.-]+\.[a-zA-Z]{2,4}'
+    trouves = re.findall(motif, texte_brut)
+    emails_propres = [e for e in trouves if not e.lower().endswith(('.png', '.jpg', '.gif', 'sentry.io', 'w3.org'))]
+    return list(set(emails_propres))
+
+
+def sauvegarder_source_de_maniere_sure(champs, lignes_medecins):
+    with verrou_fichier:
+        dossier = os.path.dirname(os.path.abspath(FICHIER_SOURCE)) or "."
+        fd, chemin_temp = tempfile.mkstemp(prefix="medecins_tmp_", suffix=".csv", dir=dossier)
+        try:
+            with os.fdopen(fd, mode='w', encoding='utf-8', newline='') as f_tmp:
+                writer_src = csv.DictWriter(f_tmp, fieldnames=champs, delimiter=';', extrasaction='ignore')
+                writer_src.writeheader()
+                writer_src.writerows(lignes_medecins)
+            os.replace(chemin_temp, FICHIER_SOURCE)
+        except Exception as e:
+            print(f"⚠️ Erreur lors de la sauvegarde du fichier source : {e}", flush=True)
+            if os.path.exists(chemin_temp):
+                os.remove(chemin_temp)
+
+
+def ajouter_resultat(prenom, nom, email, url):
+    with verrou_fichier:
+        with open(FICHIER_RESULTAT, mode='a', encoding='utf-8', newline='') as f_res:
+            writer = csv.writer(f_res, delimiter=';')
+            writer.writerow([prenom, nom, email, url])
+
+
+def attendre_si_pause_en_cours():
+    with verrou_etat:
+        pause_jusqu_a = etat_global['pause_jusqu_a']
+    maintenant = time.time()
+    if maintenant < pause_jusqu_a:
+        attente = pause_jusqu_a - maintenant
+        print(f"⏸ [Pause globale] {int(attente)}s restantes...", flush=True)
+        time.sleep(attente)
+
+
+def signaler_medecin_traite(nom_thread):
+    with verrou_etat:
+        etat_global['compteur'] += 1
+        compteur_actuel = etat_global['compteur']
+        if compteur_actuel % PAUSE_TOUS_LES_N == 0:
+            etat_global['pause_jusqu_a'] = time.time() + DUREE_PAUSE
+            print(f"\n🛑 [{nom_thread}] {compteur_actuel} médecins traités au total. "
+                  f"Pause de {DUREE_PAUSE // 60} minute(s) pour tous les threads...\n", flush=True)
+
+
+def creer_driver():
+    from selenium import webdriver
     options = webdriver.ChromeOptions()
-    
-    # Activez ces 3 lignes si vous lancez sur GITHUB ACTIONS (mode invisible)
-    # options.add_argument("--headless=new") 
-    # options.add_argument("--no-sandbox")
-    # options.add_argument("--disable-dev-shm-usage")
-    
-    # Options pour le lancement LOCAL (visible)
-    options.add_argument("--start-maximized")
-    
+    if MODE_HEADLESS:
+        options.add_argument("--headless=new")
+        options.add_argument("--no-sandbox")
+        options.add_argument("--disable-dev-shm-usage")
+        options.add_argument("--disable-gpu")
+        # Évite le blocage de communication avec Chrome sous Linux
+        options.add_argument("--remote-debugging-pipe")
+        options.add_argument("--window-size=1920,1080")
+    else:
+        options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
     options.add_experimental_option("excludeSwitches", ["enable-automation"])
     options.add_experimental_option('useAutomationExtension', False)
-    
-    driver = webdriver.Chrome(options=options)
-    return driver
-
-def chercher_urls_pdf_via_duckduckgo(driver, nom, prenom):
-    """Effectue la recherche sur DuckDuckGo et extrait les liens PDF."""
-    nom_q = nom.strip().replace('"', '')
-    prenom_q = prenom.strip().replace('"', '')
-    
-    # Syntaxe de recherche DuckDuckGo (identique à Google)
-    requete = f'"{prenom_q} {nom_q}" (registre OR ordre OR annuaire OR medecins) filetype:pdf'
-    liens_pdf = []
-    
+    with verrou_demarrage_driver:
+        return webdriver.Chrome(options=options)
+def verifier_si_captcha(driver, nom_thread, prenom, nom):
+    mots_cles_bloquants = [
+        "captcha", "g-recaptcha", "cloudflare", "hcaptcha", "checking your browser",
+        "please verify you are a robot", "pas un robot", "automated access"
+    ]
     try:
-        # Navigation vers DuckDuckGo
-        driver.get("https://duckduckgo.com/?q=")
-        time.sleep(2)
-        
-        # Saisie de la requête dans la barre de recherche DuckDuckGo
-        # Le champ de recherche DuckDuckGo utilise l'identifiant 'search_form_input' ou le nom 'q'
-        try:
-            barre_recherche = driver.find_element(By.NAME, "q")
-        except:
-            barre_recherche = driver.find_element(By.ID, "search_form_input")
-            
-        barre_recherche.send_keys(requete)
-        barre_recherche.send_keys(Keys.ENTER)
-        time.sleep(3) # Laisse le temps aux résultats dynamiques de charger
-        
-        # Extraction de tous les liens de la page de résultats
-        elements_liens = driver.find_elements(By.XPATH, '//a[@href]')
-        for elem in elements_liens:
-            href = elem.get_attribute("href")
-            # Élimine les redirections internes DuckDuckGo et ne garde que les PDF
-            if href and href.lower().endswith('.pdf') and "duckduckgo.com/?q=" not in href.lower():
-                liens_pdf.append(href)
-                
-    except Exception as e:
-        print(f"    ⚠️ Problème de navigation DuckDuckGo pour {prenom} {nom}")
-        
-    return list(set(liens_pdf))[:2]
-
-def extraire_tous_les_emails(texte_brut):
-    """Extrait les e-mails en corrigeant les espacements induits par les PDF."""
-    texte_nettoye = re.sub(r'\s*@\s*', '@', texte_brut)
-    texte_nettoye = re.sub(r'\s*\.\s*([a-zA-Z]{2,4})\b', r'.\1', texte_nettoye)
-
-    regex_email = r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}'
-    matches = re.findall(regex_email, texte_nettoye)
-
-    liste_noire_technique = ['ccsd', 'api', 'w3.org', 'example', 'pappers', 'adobe', 'macrovision']
-    emails_valides = set()
-    for email in matches:
-        if any(ex in email.lower() for ex in liste_noire_technique):
-            continue
-        emails_valides.add(email.lower())
-    return list(emails_valides)
-
-def scanner_pdf_integral(url):
-    """Télécharge en tâche de fond le PDF trouvé pour extraire son contenu."""
-    headers = {'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64)'}
-    try:
-        response = requests.get(url, headers=headers, timeout=15)
-        if response.status_code == 200 and b"%PDF" in response.content[:4]:
-            pdf_file = io.BytesIO(response.content)
-            reader = PdfReader(pdf_file)
-            texte_accumule = ""
-            for page in reader.pages:
-                text_page = page.extract_text()
-                if text_page:
-                    texte_accumule += text_page + "\n"
-            return texte_accumule
-    except Exception:
+        html_page = driver.page_source.lower()
+        url_actuelle = driver.current_url.lower()
+        for mot in mots_cles_bloquants:
+            if mot in html_page or mot in url_actuelle:
+                print(f"\n🛑 [{nom_thread}] [ALERTE CAPTCHA DETECTÉ] pour Dr {prenom} {nom} via : '{mot}'", flush=True)
+                return True
+    except:
         pass
-    return ""
+    return False
 
-def traiter_un_medecin(donnees_medecin, fichier_sortie):
-    """Fonction exécutée en parallèle pour traiter un médecin de A à Z via DuckDuckGo."""
-    idx, prenom, nom = donnees_medecin
-    print(f"🔍 [Thread Actif] Dr {prenom} {nom} (Ligne {idx})")
-    
-    driver = initialiser_navigateur()
-    trouve_au_moins_un_mail = False
-    
+
+def collecter_liens_ddg(driver):
+    liens_trouves = []
+    selectors = ["[data-testid='result-title-a']", ".result__url", "a[data-testid='result-extras-url-link']"]
+    for sel in selectors:
+        try:
+            elements = driver.find_elements(By.CSS_SELECTOR, sel)
+            for elem in elements:
+                href = elem.get_attribute("href")
+                if href and "duckduckgo.com/?q=s" not in href and href not in liens_trouves:
+                    liens_trouves.append(href)
+        except:
+            continue
+    return liens_trouves
+
+
+def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
+    prenom = medecin.get(cle_prenom, '').strip()
+    nom = medecin.get(cle_nom, '').strip()
+
+    affichage_nom = f"{prenom} {nom}" if prenom.lower() != nom.lower() else nom
+    print(f"[{nom_thread}] Extraction en cours : {affichage_nom}...", flush=True)
+
+    mots_cles = "cpts msp sisa thèse"
+    requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
+    url_initiale = f"https://duckduckgo.com/?q=s{quote(requete_complete)}"
+    urls_a_visiter = []
+
     try:
-        # Appel de la recherche DuckDuckGo
-        urls_pdf = chercher_urls_pdf_via_duckduckgo(driver, nom, prenom)
+        driver.get(url_initiale)
+        time.sleep(3)
         
-        if urls_pdf:
-            for url_pdf in urls_pdf:
-                print(f"    📄 PDF trouvé pour Dr {nom} : {url_pdf[:60]}...")
-                texte = scanner_pdf_integral(url_pdf)
-                if texte:
-                    emails = extraire_tous_les_emails(texte)
-                    if emails:
-                        print(f"    ✅ {len(emails)} mail(s) extrait(s) pour Dr {prenom} {nom} !")
-                        trouve_au_moins_un_mail = True
-                        emails_fusionnes = ",".join(emails)
-                        
-                        # ÉCRITURE EN TEMPS RÉEL CSV
-                        with verrou_fichier:
-                            with open(fichier_sortie, mode='a', encoding='utf-8', newline='') as f_out:
-                                writer = csv.writer(f_out, delimiter=',', quoting=csv.QUOTE_MINIMAL)
-                                writer.writerow([nom, prenom, emails_fusionnes, url_pdf])
-                                f_out.flush()
-        
-        # Si aucun e-mail n'a été trouvé (pas de PDF ou PDF exempt d'e-mails)
-        if not trouve_au_moins_un_mail:
-            print(f"    ❌ Aucun mail trouvé pour Dr {prenom} {nom}.")
-            with verrou_fichier:
-                with open(fichier_sortie, mode='a', encoding='utf-8', newline='') as f_out:
-                    writer = csv.writer(f_out, delimiter=',', quoting=csv.QUOTE_MINIMAL)
-                    writer.writerow([nom, prenom, "Non trouvé", ""])
-                    f_out.flush()
+        if verifier_si_captcha(driver, nom_thread, prenom, nom):
+            ajouter_resultat(prenom, nom, "Bloqué par Captcha (Moteur)", url_initiale)
+            medecin['statut'] = 'Traité'
+            return
+
+        urls_a_visiter.extend(collecter_liens_ddg(driver))
+    except Exception as e:
+        print(f"[{nom_thread}] Erreur lors de la lecture de DuckDuckGo : {e}", flush=True)
+
+    urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
+    email_trouve = "Non disponible"
+    url_source_finale = url_initiale
+
+    if urls_a_visiter:
+        print(f"[{nom_thread}] -> {len(urls_a_visiter)} site(s) web trouvé(s) à analyser.", flush=True)
+        for url in urls_a_visiter:
+            try:
+                if any(excl in url.lower() for excl in ["pagesjaunes", "mappy", "facebook", "linkedin", "twitter"]):
+                    continue
+                driver.get(url)
+                time.sleep(2)
+
+                if verifier_si_captcha(driver, nom_thread, prenom, nom):
+                    continue
+
+                texte_site = driver.find_element(By.TAG_NAME, "body").text
+                mails_site = extraire_emails_du_texte_page(texte_site)
+
+                if mails_site:
+                    email_trouve = " ; ".join(mails_site)
+                    url_source_finale = url
+                    print(f"[{nom_thread}] -> [SUCCÈS] Mail trouvé sur : {url}", flush=True)
+                    break
+            except:
+                continue
+    else:
+        print(f"[{nom_thread}] -> Aucun site web externe détecté.", flush=True)
+
+    ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
+    medecin['statut'] = 'Traité'
+
+
+def travail_thread(champs, lignes_medecins, cle_prenom, cle_nom, nom_thread):
+    driver = None
+    try:
+        driver = creer_driver()
+        while True:
+            attendre_si_pause_en_cours()
+            medecin_a_traiter = None
+            
+            with verrou_etat:
+                for row in lignes_medecins:
+                    if row.get('statut', '').strip().lower() != 'traité':
+                        row['statut'] = 'Traité'
+                        medecin_a_traiter = row
+                        break
+            
+            if not medecin_a_traiter:
+                print(f"🏁 [{nom_thread}] Plus aucun médecin à traiter. Fermeture.", flush=True)
+                break
+                
+            try:
+                traiter_medecin(driver, medecin_a_traiter, cle_prenom, cle_nom, nom_thread)
+            except Exception as e:
+                print(f"❌ [{nom_thread}] Erreur inattendue sur une ligne : {e}", flush=True)
+                
+            sauvegarder_source_de_maniere_sure(champs, lignes_medecins)
+            signaler_medecin_traite(nom_thread)
     finally:
-        driver.quit()
+        if driver:
+            driver.quit()
+
 
 if __name__ == "__main__":
-    FICHIER_CSV = "villes.csv"
-    FICHIER_SORTIE = "emails_visuels.csv"
-    NB_THREADS_SIMULTANES = 4 
-
-    if not os.path.exists(FICHIER_CSV):
-        print(f"❌ Erreur : '{FICHIER_CSV}' introuvable.")
+    if not initialiser_fichiers():
         exit(1)
 
-    with open(FICHIER_CSV, mode='r', encoding='utf-8', errors='ignore') as f:
-        lignes_brutes = [l.strip() for l in f.read().splitlines() if l.strip()]
+    print("📖 Chargement et analyse du fichier source...", flush=True)
+    champs, lignes_medecins = lire_csv_avec_fallback_encodage(FICHIER_SOURCE)
 
-    print(f"🚀 Initialisation. {len(lignes_brutes) - 1} lignes prêtes à être réparties sur DuckDuckGo...")
+    cle_prenom = next((c for c in champs if 'prénom' in c.lower() or 'prenom' in c.lower()), None)
+    cle_nom = next((c for c in champs if 'nom' in c.lower()), None)
 
-    # Création de l'en-tête CSV s'il n'existe pas encore
-    if not os.path.exists(FICHIER_SORTIE):
-        with open(FICHIER_SORTIE, mode='w', encoding='utf-8', newline='') as f_init:
-            writer = csv.writer(f_init, delimiter=',')
-            writer.writerow(["Nom", "Prénom", "E-mail Extrait", "Source PDF"])
+    if not cle_prenom or not cle_nom:
+        print(f"❌ Erreur : Colonnes 'Prénom' ou 'Nom' manquantes dans {FICHIER_SOURCE}.", flush=True)
+        exit(1)
 
-    liste_medecins_A_traiter = []
+    if 'statut' not in champs:
+        champs.append('statut')
 
-    for idx, ligne_propre in enumerate(lignes_brutes):
-        if idx == 0: 
-            continue 
-        
-        if ';' in ligne_propre:
-            elements = ligne_propre.split(';')
-        elif '\t' in ligne_propre:
-            elements = re.split(r'\t+', ligne_propre)
-        else:
-            elements = re.split(r'\s{2,}', ligne_propre)
-        elements = [el.strip() for el in elements if el.strip()]
-        
-        if len(elements) < 2: 
-            continue
+    lignes_filtrées = [l for l in lignes_medecins if l.get('statut', '').strip().lower() != 'traité']
+    print(f"🔥 {len(lignes_filtrées)} médecin(s) restant(s) à extraire.", flush=True)
 
-        prenom = elements[0]
-        nom = elements[1]
+    if not lignes_filtrées:
+        print("🏁 Tous les médecins de la liste ont déjà été marqués comme 'Traité'.", flush=True)
+        exit(0)
 
-        if prenom.lower() in ['prenom', 'prénom', 'nom', 'name'] or nom.lower() in ['nom', 'name']:
-            continue
+    threads_actifs = []
+    for i in range(NB_THREADS):
+        nom_t = f"Thread-{i+1}"
+        t = threading.Thread(
+            target=travail_thread, 
+            args=(champs, lignes_medecins, cle_prenom, cle_nom, nom_t),
+            name=nom_t
+        )
+        threads_actifs.append(t)
+        t.start()
+        time.sleep(1.5)
 
-        liste_medecins_A_traiter.append((idx, prenom, nom))
+    for t in threads_actifs:
+        t.join()
 
-    print(f"🔥 Lancement des {NB_THREADS_SIMULTANES} instances en parallèle via DuckDuckGo...")
-    
-    with ThreadPoolExecutor(max_workers=NB_THREADS_SIMULTANES) as executor:
-        executor.map(lambda med: traiter_un_medecin(med, FICHIER_SORTIE), liste_medecins_A_traiter)
-
-    print("\n🏁 [FIN DU SCRIPT] Toutes les lignes ont été traitées.")
+    print("\n🏁 [FIN DU SCRIPT] Exécution terminée.", flush=True)
