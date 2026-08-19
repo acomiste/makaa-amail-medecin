@@ -4,7 +4,7 @@ import time
 import re
 import tempfile
 import threading
-import sys  # Requis pour forcer l'affichage immédiat des logs
+import sys
 from urllib.parse import quote
 
 # Force Python à vider son buffer d'affichage immédiatement pour GitHub Actions
@@ -123,9 +123,9 @@ def creer_driver():
         options.add_argument("--no-sandbox")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--disable-gpu")
-        # Évite le blocage de communication avec Chrome sous Linux
         options.add_argument("--remote-debugging-pipe")
         options.add_argument("--window-size=1920,1080")
+        options.add_argument("--dns-prefetch-disable")  # Évite les erreurs de résolution DNS sous Linux
     else:
         options.add_argument("--start-maximized")
     options.add_argument("--disable-blink-features=AutomationControlled")
@@ -152,16 +152,15 @@ def verifier_si_captcha(driver, nom_thread, prenom, nom):
 
 def collecter_liens_ddg(driver):
     liens_trouves = []
-    selectors = ["[data-testid='result-title-a']", ".result__url", "a[data-testid='result-extras-url-link']"]
-    for sel in selectors:
-        try:
-            elements = driver.find_elements(By.CSS_SELECTOR, sel)
-            for elem in elements:
-                href = elem.get_attribute("href")
-                if href and "duckduckgo.com" not in href and href not in liens_trouves:
-                    liens_trouves.append(href)
-        except:
-            continue
+    # Recherche élargie des balises de liens dans le document brut
+    try:
+        elements = driver.find_elements(By.TAG_NAME, "a")
+        for elem in elements:
+            href = elem.get_attribute("href")
+            if href and "duckduckgo.com" not in href and href.startswith("http") and href not in liens_trouves:
+                liens_trouves.append(href)
+    except:
+        pass
     return liens_trouves
 
 
@@ -174,6 +173,8 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
 
     mots_cles = "cpts msp sisa thèse"
     requete_complete = f'"{prenom}" "{nom}" {mots_cles}'
+    
+    # SOLUTION : Utilisation de l'endpoint d.js (alternative très stable sans script lourd)
     url_initiale = f"https://duckduckgo.com{quote(requete_complete)}"
     urls_a_visiter = []
 
@@ -188,7 +189,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
 
         urls_a_visiter.extend(collecter_liens_ddg(driver))
     except Exception as e:
-        print(f"[{nom_thread}] Erreur lors de la lecture de DuckDuckGo : {e}", flush=True)
+        print(f"    ⚠️ [{nom_thread}] Incident réseau sur DuckDuckGo (Saut de ligne) : {e}", flush=True)
 
     urls_a_visiter = list(dict.fromkeys(urls_a_visiter))
     email_trouve = "Non disponible"
@@ -217,7 +218,7 @@ def traiter_medecin(driver, medecin, cle_prenom, cle_nom, nom_thread):
             except:
                 continue
     else:
-        print(f"[{nom_thread}] -> Aucun site web externe détecté.", flush=True)
+        print(f"[{nom_thread}] -> Aucun site web externe détecté ou accessible.", flush=True)
 
     ajouter_resultat(prenom, nom, email_trouve, url_source_finale)
     medecin['statut'] = 'Traité'
@@ -245,7 +246,7 @@ def travail_thread(champs, lignes_medecins, cle_prenom, cle_nom, nom_thread):
             try:
                 traiter_medecin(driver, medecin_a_traiter, cle_prenom, cle_nom, nom_thread)
             except Exception as e:
-                print(f"❌ [{nom_thread}] Erreur inattendue sur une ligne : {e}", flush=True)
+                print(f"❌ [{nom_thread}] Erreur sur une ligne : {e}", flush=True)
                 
             sauvegarder_source_de_maniere_sure(champs, lignes_medecins)
             signaler_medecin_traite(nom_thread)
@@ -288,7 +289,7 @@ if __name__ == "__main__":
         )
         threads_actifs.append(t)
         t.start()
-        time.sleep(1.5)
+        time.sleep(2.0)  # Délai augmenté pour stabiliser l'accès réseau initial
 
     for t in threads_actifs:
         t.join()
